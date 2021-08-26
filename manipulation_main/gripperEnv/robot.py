@@ -162,7 +162,7 @@ class RobotEnv(World):
         new_obs = self._observe()
 
         reward, self.status = self._reward_fn(self.obs, action, new_obs)
-        self.episode_rewards[self.episode_step] = reward
+        #self.episode_rewards[self.episode_step] = reward
 
         if self.status != RobotEnv.Status.RUNNING:
             done = True
