@@ -5,6 +5,7 @@ Code modified from: https://github.com/sweetice/Deep-reinforcement-learning-with
 import argparse
 from itertools import count
 
+import math
 import os, sys, random
 import numpy as np
 
@@ -13,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import matplotlib.pyplot as plt
 from torch.distributions import Normal
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -78,11 +80,18 @@ class Critic(nn.Module):
 
 
 class DDPG(object):
-    def __init__(self, state_dim, action_dim, max_action,
-                 gamma=0.99, tau=0.005, epsilon=0.1):
-        self.gamma = gamma
-        self.tau = tau
-        self.epsilon = epsilon
+    def __init__(self, state_dim, action_dim, max_action, config=None,
+                 gamma=0.99, tau=0.005, batch_size=32):
+        if config is None:
+            self.config = None
+            self.gamma = gamma
+            self.tau = tau
+            self.batch_size = batch_size
+        else:
+            self.config = config
+            self.gamma = config['gamma']
+            self.tau = config['tau']
+            self.batch_size = config['batch_size']
 
         self.actor_agent = Actor(state_dim, action_dim, max_action).to(device)
         self.critic_agent = Critic(state_dim, action_dim).to(device)
@@ -101,18 +110,27 @@ class DDPG(object):
         self.num_actor_update_iteration = 0
         self.num_training = 0
 
-    def epsilon_greedy_action(self, state, low = 0, high = 1):
+    def update_epsilone(self, epoch, EPS_START=10, EPS_END=0, EPS_DECAY=10000):
+        if self.config == None:
+            self.epsilon = EPS_END + (EPS_START - EPS_END) * math.exp(-1. * epoch / EPS_DECAY)
+        else:
+            self.epsilon = (self.config['epsilon_start'] - self.config['epsilon_end'])
+            self.epsilon *= math.exp(-1. * epoch / self.config['epsilon_decay'])
+            self.epsilon += self.config['epsilon_end']
+        return
+
+    def epsilon_greedy_action(self, state, dim, low = -1, high = 1):
         state = torch.FloatTensor(state.reshape(1, -1)).to(device)
         action = self.actor_agent(state)
         action = action.cpu().data.numpy().flatten()
-        action += np.random.normal(0, self.epsilon, size=env.action_space.shape[0])
+        action += np.random.normal(0, self.epsilon, size=dim)
         action = action.clip(low, high)
         return action
 
     def update(self, update_iteration):
         for it in range(update_iteration):
             # Sample from replay buffer
-            x, y, a, r, d = self.replay_buffer.sample(32)
+            x, y, a, r, d = self.replay_buffer.sample(self.batch_size)
             curr_state = torch.FloatTensor(x).to(device)
             next_state = torch.FloatTensor(y).to(device)
             action = torch.FloatTensor(a).to(device)
@@ -130,7 +148,7 @@ class DDPG(object):
             critic_loss.backward()
             self.critic_optimizer.step()
 
-            ## Training critic
+            ## Training actor
             self.actor_optimizer.zero_grad()
 
             actor_loss = self.critic_agent(curr_state, self.actor_agent(curr_state))
@@ -148,6 +166,24 @@ class DDPG(object):
             self.num_actor_update_iteration += 1
             self.num_critic_update_iteration += 1
 
+    def load_weight(self, model_dir="./checkpoints/DDPG_tmp.pth"):
+        model = torch.load(model_dir, map_location=device)
+        self.actor_agent.load_state_dict(model['actor_agent'])
+        self.critic_agent.load_state_dict(model['critic_agent'])
+        self.actor_target.load_state_dict(model['actor_target'])
+        self.critic_target.load_state_dict(model['critic_target'])
+        return
+
+    def save_weight(self, model_dir="./checkpoints/DDPG_tmp.pth"):
+        checkpoint = {
+            'actor_agent': self.actor_agent.state_dict(),
+            'critic_agent': self.critic_agent.state_dict(),
+            'actor_target': self.actor_target.state_dict(),
+            'critic_target': self.critic_target.state_dict()
+        }
+        torch.save(checkpoint, model_dir)
+        return
+
 if __name__ == '__main__':
     env = gym.make("Pendulum-v0")
 
@@ -156,32 +192,39 @@ if __name__ == '__main__':
     max_action = float(env.action_space.high[0])
 
     agent = DDPG(state_dim, action_dim, max_action)
+    #agent.load_weight()
     
-    total_step = 0
-    max_episode = 100
+    total_step, max_reward = 0, -float("inf")
+    max_episode = 300
     eval_steps, eval_rewards = [], []
     for i in range(max_episode):
-        total_reward = 0
-        step = 0
-        state = env.reset()
+        step, total_reward = 0, 0
+        curr_state = env.reset()
         for t in count():
-            action = agent.epsilon_greedy_action(state, env.action_space.low, env.action_space.high)
+            action = agent.epsilon_greedy_action(curr_state, action_dim, env.action_space.low, env.action_space.high)
 
             next_state, reward, done, info = env.step(action)
             if total_step % 100 == 0 : env.render()
-            agent.replay_buffer.push((state, next_state, action, reward, np.float(done)))
+            agent.replay_buffer.push((curr_state, next_state, action, reward, np.float(done)))
 
-            state = next_state
+            curr_state = next_state
             if done: break
+
             step += 1
             total_reward += reward
         total_step += step+1
-        print(f"Total T:{total_step} Episode: \t{i} Total Reward: \t{total_reward:0.2f}")
         eval_steps.append(total_step)
         eval_rewards.append(total_reward)
         agent.update(2000)
-
-plt.figure(figsize=(15, 15))
-plt.title('reward')
-plt.plot(eval_steps, eval_rewards, 'r')
-plt.savefig('./demo/ddpg_example.png')
+        
+        if max_reward < total_reward:
+            max_reward = total_reward
+            agent.save_weight()
+            print(f"Total T:{total_step} Episode: \t{i} Total Reward: \t{total_reward:0.2f}")
+    
+    '''
+    plt.figure(figsize=(15, 15))
+    plt.title('reward')
+    plt.plot(eval_steps, eval_rewards, 'r')
+    plt.savefig('./demo/ddpg_example.png)
+    '''

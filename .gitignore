@@ -171,8 +171,10 @@ cython_debug/
 
 # End of https://www.toptal.com/developers/gitignore/api/visualstudiocode,python,jupyternotebooks
 
-# generated videos
+# generated files
 videos/
+checkpoints/
+wandb/
 
 # generated fontlist
 fontlist*.json
