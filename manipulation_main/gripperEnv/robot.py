@@ -11,9 +11,9 @@ from enum import Enum
 from manipulation_main.common import io_utils
 from manipulation_main.common import transformations
 from manipulation_main.common import transform_utils
-from manipulation_main.gripperEnv import sensor, actuator
+from manipulation_main.gripperEnv import sensor, encoder, actuator
 from manipulation_main.simulation.simulation import World 
-from manipulation_main.gripperEnv.rewards import Reward, SimplifiedReward, ShapedCustomReward
+from manipulation_main.gripperEnv.rewards import CustomReward
 from manipulation_main.gripperEnv.curriculum import WorkspaceCurriculum
 
 def _reset(robot, actuator, depth_sensor, skip_empty_states=False):
@@ -30,7 +30,6 @@ def _reset(robot, actuator, depth_sensor, skip_empty_states=False):
             ok = True
 
 class RobotEnv(World):
-    metadata = {'render.modes': ['rgb_array']}
 
     class Events(Enum):
         START_OF_EPISODE = 0
@@ -43,6 +42,7 @@ class RobotEnv(World):
         SUCCESS = 1
         FAIL = 2
         TIME_LIMIT = 3
+        OUT_BOUND = 4
 
     def __init__(self, config, evaluate=False, test=False, validate=False):
         if not isinstance(config, dict):
@@ -72,19 +72,21 @@ class RobotEnv(World):
         self._camera = sensor.RGBDSensor(config['sensor'], self)
 
         # Assign the reward fn
+        self._reward_fn = CustomReward(config['reward'], self)
+        '''
         if self._simplified:
             self._reward_fn = SimplifiedReward(config['reward'], self)
         elif config['reward']['custom']:
             self._reward_fn = ShapedCustomReward(config['reward'], self)
         else:    
             self._reward_fn = Reward(config['reward'], self)
+        '''
 
         # Assign the sensors
         if self.depth_obs or self.full_obs:
             self._sensors = [self._camera]
         else:
-            self._encoder = sensor.EncodedDepthImgSensor(
-                                    config, self._camera, self)
+            self._encoder = sensor.EncodedDepthImgSensor(config, self._camera, self)
             self._sensors = [self._encoder]
         if not self._simplified:
             self._sensors.append(self._actuator)
@@ -162,31 +164,30 @@ class RobotEnv(World):
         new_obs = self._observe()
 
         reward, self.status = self._reward_fn(self.obs, action, new_obs)
-        self.episode_rewards[self.episode_step] = reward
+        #self.episode_rewards[self.episode_step] = reward
 
-        if self.status != RobotEnv.Status.RUNNING:
+
+        if self.status == RobotEnv.Status.SUCCESS:
             done = True
         elif self.episode_step == self.time_horizon - 1:
             done, self.status = True, RobotEnv.Status.TIME_LIMIT
         else:
             done = False
-
+        
         if done:
             self._trigger_event(RobotEnv.Events.END_OF_EPISODE, self)
+
+        position, _ = self.get_pose()
+        is_in_bound = "in" if (position[0] < 0.3) and (position[1] < 0.3) and (position[2] < 0.25) and (position[2] > 0) else "out"
 
         self.episode_step += 1
         self.obs = new_obs
         if len(self.curriculum._history) != 0:
             self.sr_mean = np.mean(self.curriculum._history)
         super().step_sim()
-        return self.obs, reward, done, {"is_success":self.status==RobotEnv.Status.SUCCESS, "episode_step": self.episode_step, "episode_rewards": self.episode_rewards, "status": self.status}
-
-    def render(self, mode='human'):
-        if mode == 'rgb_array':
-            return self._observe()[..., :3].astype(np.uint8) # return RGB frame suitable for video
-        else:
-            super().render(mode=mode) # just raise an exception
-
+        #return self.obs, reward, done, {"is_success":self.status==RobotEnv.Status.SUCCESS, "episode_step": self.episode_step, "episode_rewards": self.episode_rewards, "status": self.status}
+        return self.obs, reward, done, {"status": self.status, "position": is_in_bound}
+        
     def _observe(self):
         if not self.depth_obs and not self.full_obs:
             obs = np.array([])

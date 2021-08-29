@@ -1,78 +1,99 @@
+import os
 import numpy as np
-from itertools import count
-import random
-import gym.spaces
+import pybullet as p
 from tqdm import tqdm
+from itertools import count
+
 import gym
-from utils.gym import get_env, get_wrapper_by_name
-from utils.plot import plot_line
+import manipulation_main
+from policy.DDPG import DDPG
 from manipulation_main.common import io_utils
-import logging
-logging.getLogger().setLevel(logging.DEBUG) 
+from manipulation_main.gripperEnv.robot import RobotEnv
+from manipulation_main.gripperEnv.encoder import AutoEncoder, embed_state
 
-# Hyperparameters
+import torch
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+import wandb
+import warnings
+wandb.init(project="grasping_ddpg")
+warnings.filterwarnings("ignore")
+
+# config
 config = io_utils.load_yaml("config/gripper_grasp.yaml")
-env = get_env("gripper-env-v0", config=config, seed=0, idx_to_save_video=(0,))
-gamma=0.99
-total_timestep=100_000
+visualize = config.get('visualize', True) 
 
-assert type(env.observation_space) == gym.spaces.Box
-assert type(env.action_space)      == gym.spaces.Box
+# build env
+env = gym.make("gripper-env-v0", config=config)
+cur_state = env.reset()
 
-###############
-# BUILD MODEL #
-###############
+# encoder
+encoder = AutoEncoder(config).to(device)
+encoder.load_weight("./checkpoints/encoder_000018_.pth")
+enc_state = encoder.encode(embed_state(cur_state))
+state_dim = enc_state.flatten().shape[0]
+
+# model
 img_h, img_w, img_c = 64, 64, 3
 action_shape = env.action_space.shape
-action_min = env.action_space.low
-action_max = env.action_space.high
+action_dim = action_shape[0]
+action_min = float(env.action_space.low[0])
+action_max = float(env.action_space.high[0])
 
-###############
-# RUN ENV     #
-###############
-num_param_updates = 0
-mean_episode_reward = -float('nan')
-best_mean_episode_reward = -float('inf')
-last_obs = env.reset()
-log_every_n_steps = 1000
-metrics = {'steps': [], 'rewards': [], 'Qs': [], 'best_avg_reward': -float('inf')}
+agent = DDPG(state_dim, action_dim, action_max, config.get('DDPG'))
+agent.load_weight("./checkpoints/agent_000195_.pth")
+wandb.watch(agent.actor_agent)
+wandb.watch(agent.critic_agent)
 
-with tqdm(total=total_timestep) as pbar:
-    for t in count():
-        # update progress bar
-        pbar.n = t
-        pbar.refresh()
+# main loop
+max_episode = 1_000_000
+success, total_step = [], 0
+for epoch in range(max_episode):
+    agent.update_epsilone(epoch)
+    step, total_reward = 0, 0.0
+    
+    cur_state = env.reset()
+    cur_state = encoder.encode(embed_state(cur_state))
+    cur_state = cur_state.flatten()
 
-        ### Check stopping criterion
-        if t >= total_timestep:
-            break
+    # take action 
+    while True:
+        action = agent.epsilon_greedy_action(cur_state, action_dim, action_min, action_max)
 
-        action = np.random.rand(5)
-        action = action * (action_max - action_min) + action_min
-        obs, reward, done, _ = env.step(action)
-        # normalize rewards between -1 and 1, -200 < reward < 10000
-        reward = reward / 10000.0
-        # Resets the environment when reaching an episode boundary.
-        if done:
-            obs = env.reset()
-        last_obs = obs
+        nxt_state, reward, done, info = env.step(action)
+        nxt_state = encoder.encode(embed_state(nxt_state))
+        nxt_state = nxt_state.flatten()
 
-        ### 4. Log progress and keep track of statistics
-        episode_rewards = get_wrapper_by_name(env, "Monitor").get_episode_rewards()
-        if len(episode_rewards) > 0:
-            mean_episode_reward = np.mean(episode_rewards[-100:])
-        if len(episode_rewards) > 100:
-            best_mean_episode_reward = max(best_mean_episode_reward, mean_episode_reward)
+        agent.replay_buffer.push((cur_state, nxt_state, action, reward, np.float(done)))
 
-        if t % log_every_n_steps == 0:
-            tqdm.write("=========================================")
-            tqdm.write("Timestep %d" % (t,))
-            tqdm.write("mean reward (100 episodes) %f" % mean_episode_reward)
-            tqdm.write("best mean reward %f" % best_mean_episode_reward)
-            tqdm.write("episodes %d" % len(episode_rewards))
-            tqdm.write("=========================================")
-            # Test Q-values over validation memory
-            metrics['rewards'].append([np.mean(episode_rewards[-5:])])
-            metrics['steps'].append(t)
+        step += 1; total_reward += reward
+        cur_state = nxt_state
+        if done: success.append(1) if info['status'] == RobotEnv.Status.SUCCESS else success.append(0); break
+    total_step += step
 
-            plot_line(metrics['steps'], metrics['rewards'], 'Reward')
+    # success rate
+    if len(success) < 100:
+        success_rate = np.mean(success)
+    else:
+        success_rate = np.mean(success[20:])
+    
+    # logging
+    print(f"Episode: {epoch:7d} Total Reward: {total_reward:7.2f}\t", end=" ")
+    print(f"Epsilon: {agent.epsilon:1.2f} \t", end=" ")
+    print(f"Position: {info['position']} \tSuccess: {success_rate:0.2f} \t{info['status']}")
+    wandb.log({"epoch"        : epoch})
+    wandb.log({"total_step"   : total_step})
+    wandb.log({"success_rate" : success_rate})
+    wandb.log({"epsilon"      : agent.epsilon})
+    wandb.log({"reward/total" : total_reward})
+
+    # agent traning with warm start
+    if epoch > 0:
+        agent.update(1000) 
+    
+    # save
+    if success_rate > 0.8 and len(success) > 10:
+        agent.save_weight(f"./checkpoints/agent_{epoch:06d}.pth")
+        exit()
+
+

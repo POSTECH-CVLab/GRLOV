@@ -1,0 +1,11 @@
+gym
+matplotlib
+opencv-python
+pybullet==2.6.4
+pytest
+PyYAML
+scikit-learn
+tqdm
+numba
+pyglet
+wandb

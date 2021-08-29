@@ -1,6 +1,5 @@
 from manipulation_main.gripperEnv import robot
 
-
 class Reward:
     """Simple reward function reinforcing upwards movement of grasped objects."""
 
@@ -14,6 +13,8 @@ class Reward:
         self._delta_z_scale = config['delta_z_scale']
         self._lift_success = config.get('lift_success', self._terminal_reward)
         self._time_penalty = config.get('time_penalty', False)
+        self._out_penalty = config.get('out_penalty', False)
+        self._close_penalty = config.get('close_panelty', False)
         self._table_clearing = config.get('table_clearing', False)
         self.lift_dist = None
 
@@ -21,6 +22,7 @@ class Reward:
         self._lifting = False
         self._start_height = None
         self._old_robot_height = None
+        self._old_gripper_close = True
 
     def __call__(self, obs, action, new_obs):
         position, _ = self._robot.get_pose()
@@ -55,7 +57,7 @@ class Reward:
         position, _ = self._robot.get_pose()
         self._old_robot_height = position[2]
 
-
+'''
 class SimplifiedReward:
     """Reward function for the simplified grasp robot.RobotEnv."""
 
@@ -92,14 +94,15 @@ class SimplifiedReward:
     def reset(self):
         position, _ = self._robot.get_pose()
         self._old_robot_height = position[2]
+'''
 
-
-class ShapedCustomReward(Reward):
+class CustomReward(Reward):
 
     def __call__(self, obs, action, new_obs):
+        reward = 0.
+        
         position, _ = self._robot.get_pose()
         robot_height = position[2]
-        reward = 0.
 
         if self._robot.object_detected():
             if not self._lifting:
@@ -107,6 +110,9 @@ class ShapedCustomReward(Reward):
                 self._lifting = True
 
             if robot_height - self._start_height > self.lift_dist:
+                return self._terminal_reward, robot.RobotEnv.Status.SUCCESS
+
+                '''    
                 if self._table_clearing:
                     # Object was lifted by the desired amount
                     grabbed_obj = self._robot.find_highest()
@@ -126,12 +132,18 @@ class ShapedCustomReward(Reward):
                     if not self._shaped:
                         return 1., robot.RobotEnv.Status.SUCCESS
                     return self._terminal_reward, robot.RobotEnv.Status.SUCCESS
+                '''
+
             if self._shaped:
-                # Intermediate rewards for grasping and lifting
+                # Intermediate rewards for grasping
+                reward += self._grasp_reward
+
+                # Intermediate rewards for lifting
                 delta_z = robot_height - self._old_robot_height
-                reward = self._grasp_reward + self._delta_z_scale * delta_z
+                reward += self._delta_z_scale * delta_z
         else:
             self._lifting = False
+
 
         # Time penalty
         if self._shaped:
@@ -139,5 +151,16 @@ class ShapedCustomReward(Reward):
         else:
             reward -= 0.01
 
+        # Range out of bound penalty
+        if (position[0] > 0.3) or (position[1] > 0.3):
+            reward -= self._out_penalty
+        if (position[2] > 0.25) or (position[2] < 0):
+            reward -= self._out_penalty * 3
+
+        # Poor grasp
+        if self._old_gripper_close ^ self._robot.gripper_close:
+            reward -= self._close_penalty
+
+        self._old_gripper_close = self._robot.gripper_close
         self._old_robot_height = robot_height
         return reward, robot.RobotEnv.Status.RUNNING
